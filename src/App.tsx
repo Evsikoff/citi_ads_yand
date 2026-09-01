@@ -18,6 +18,7 @@ import {
   isBoosterWithinSessionLimit,
 } from "./game/boosters";
 import type { Booster } from "./game/boosters";
+import { getBoosterEffectSystemName } from "./game/boosterEffects";
 import boostersIcon from "./images/boosters/boosters.png";
 import { showFullscreenAd, showRewardedVideoAd } from "./game/yandexGames";
 import {
@@ -607,7 +608,7 @@ export default function App() {
       return;
     }
 
-    const effect = game.applyBooster(booster.system_name, cost);
+    const effect = game.applyBooster(getBoosterEffectSystemName(booster), cost);
     if (!effect.applied) {
       showToast("Для этого улучшения пока не настроен игровой эффект");
       return;
