@@ -39,6 +39,11 @@ interface YandexPlayer {
 }
 
 interface YandexGamesSdk {
+  environment: {
+    i18n: {
+      lang: string;
+    };
+  };
   adv: {
     showFullscreenAdv(options?: { callbacks?: FullscreenAdCallbacks }): void;
     showRewardedVideo(options?: { callbacks?: RewardedVideoAdCallbacks }): void;
@@ -80,6 +85,17 @@ let gameReadyNotification: Promise<void> | null = null;
 let gameplayActive: boolean | null = null;
 let gameplayTransition = 0;
 
+/**
+ * Определяет язык через SDK при запуске. Сейчас интерфейс переведён только на
+ * русский, поэтому для остальных языков платформы используется русский fallback.
+ */
+function applyYandexGameLanguage(initializedSdk: YandexGamesSdk): void {
+  const platformLanguage = initializedSdk.environment.i18n.lang.toLowerCase();
+  const gameLanguage = platformLanguage === "ru" ? platformLanguage : "ru";
+  document.documentElement.lang = gameLanguage;
+  console.info(`Язык Яндекс Игр: ${platformLanguage}; язык игры: ${gameLanguage}`);
+}
+
 /** Инициализирует SDK один раз при запуске приложения. */
 export function initYandexGamesSdk(): Promise<YandexGamesSdk | null> {
   if (sdk) return Promise.resolve(sdk);
@@ -92,6 +108,7 @@ export function initYandexGamesSdk(): Promise<YandexGamesSdk | null> {
     })
     .then((initializedSdk) => {
       sdk = initializedSdk;
+      applyYandexGameLanguage(initializedSdk);
       console.info("Яндекс SDK готов к работе");
       return initializedSdk;
     })
