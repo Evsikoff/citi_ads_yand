@@ -392,13 +392,13 @@ export class CityRideGame {
 
   /* ---------------- public API ---------------- */
 
-  begin(): void {
+  begin(playerName?: string): void {
     if (this.phase === "play") return;
     this.phase = "play";
     this.time = 0;
     this.topSpeed = 0;
     this.won = false;
-    this.resetFuel();
+    this.resetFuel(playerName);
     this.gameOverSent = false;
     this.initStations();
     this.emitLeaderboard();
@@ -1160,7 +1160,7 @@ export class CityRideGame {
   }
 
   /** бак, деньги, канистры и разложенные по городу канистры — в исходное состояние */
-  private resetFuel(): void {
+  private resetFuel(playerName?: string): void {
     this.fuelMax = CONFIG.startTankVolume;
     this.fuel = Math.min(CONFIG.startFuel, this.fuelMax);
     this.money = CONFIG.startMoney;
@@ -1173,7 +1173,7 @@ export class CityRideGame {
     this.sessionElapsed = 0;
     this.sessionStop = "full";
     this.totalLitersFilled = 0;
-    this.playerName = makePlayerName();
+    this.playerName = playerName ?? makePlayerName();
     this.leaderboardCd = 0;
     this.leaderboardDirty = true;
     this.atBase = false;

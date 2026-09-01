@@ -41,6 +41,7 @@ import {
   getYandexCatalog,
   getYandexFlags,
   getYandexPlayerData,
+  getYandexPlayerName,
   getYandexPurchases,
   getYandexServerTime,
   purchaseYandexProduct,
@@ -217,6 +218,7 @@ export default function App() {
   const refuelLimitRef = useRef<HTMLSpanElement>(null);
   const toastTimer = useRef<number>(0);
   const fullscreenAdRequest = useRef(false);
+  const startPending = useRef(false);
   // Активация АЗС, отправленная на сервер: пока ответа нет, бустер не потрачен.
   const pendingStationBooster = useRef<{
     requestId: string;
@@ -725,26 +727,40 @@ export default function App() {
     };
   }, [phase, musicOn]);
 
-  const start = () => {
-    sfx.init();
-    sfx.tick();
-    music.play();
-    const game = gameRef.current;
-    const network = networkRef.current;
-    const online = connectionStatus === "online" && !!network?.connected;
-    game?.setOnlineTransport(online && network ? network : null);
-    game?.begin();
-    if (online && network && game) network.join(game.getPlayerName());
-    setMapOpen(false);
-    setBoostersOpen(false);
-    setBoosterBalance(CONFIG.startMoney);
-    setBoosterPurchases({});
-    setInAppPurchases({});
-    pendingInAppActivations.current.clear();
-    setInactiveStationNearby(false);
-    setInactiveStationInReach(false);
-    dropPendingStationBooster();
-    setPhase("play");
+  const start = async () => {
+    if (startPending.current) return;
+    startPending.current = true;
+    try {
+      sfx.init();
+      sfx.tick();
+      music.play();
+
+      let playerName: string | undefined;
+      try {
+        playerName = await getYandexPlayerName();
+      } catch (error: unknown) {
+        console.info("Имя игрока Яндекса недоступно, используем случайное:", error);
+      }
+
+      const game = gameRef.current;
+      const network = networkRef.current;
+      const online = connectionStatus === "online" && !!network?.connected;
+      game?.setOnlineTransport(online && network ? network : null);
+      game?.begin(playerName);
+      if (online && network && game) network.join(game.getPlayerName());
+      setMapOpen(false);
+      setBoostersOpen(false);
+      setBoosterBalance(CONFIG.startMoney);
+      setBoosterPurchases({});
+      setInAppPurchases({});
+      pendingInAppActivations.current.clear();
+      setInactiveStationNearby(false);
+      setInactiveStationInReach(false);
+      dropPendingStationBooster();
+      setPhase("play");
+    } finally {
+      startPending.current = false;
+    }
   };
 
   const restart = () => {

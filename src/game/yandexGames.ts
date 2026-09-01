@@ -33,6 +33,7 @@ interface YandexPayments {
 }
 
 interface YandexPlayer {
+  getName(): string;
   getData(keys?: string[]): Promise<Record<string, unknown>>;
   setData(data: Record<string, unknown>, flush?: boolean): Promise<void>;
 }
@@ -166,6 +167,14 @@ async function getYandexPlayer(): Promise<YandexPlayer> {
       throw error;
     });
   return playerInitialization;
+}
+
+/** Возвращает непустое имя из профиля игрока Яндекса. */
+export async function getYandexPlayerName(): Promise<string> {
+  const player = await getYandexPlayer();
+  const name = player.getName().trim();
+  if (!name) throw new Error("Имя игрока Яндекса недоступно");
+  return name;
 }
 
 /** Читает строковые флаги Remote Config. */
