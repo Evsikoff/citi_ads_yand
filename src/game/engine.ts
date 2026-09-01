@@ -806,11 +806,19 @@ export class CityRideGame {
    * расход, топливо и деньги считает сервер, поэтому эффект уходит ему:
    * начисленное себе локально всё равно затёр бы ближайший снапшот.
    */
-  applyBooster(systemName: string, cost = 0): { applied: boolean; revived: boolean } {
+  applyBooster(
+    systemName: string,
+    cost = 0
+  ): { applied: boolean; revived: boolean; requestId?: string } {
     if (this.online?.connected) {
       // Ответ придёт событием booster-applied: деньги, топливо и множители
       // приедут в снапшоте, оживление — сообщением player:respawned.
-      return { applied: this.online.booster(systemName, cost) !== null, revived: false };
+      const requestId = this.online.booster(systemName, cost);
+      return {
+        applied: requestId !== null,
+        revived: false,
+        ...(requestId ? { requestId } : {}),
+      };
     }
 
     const speed = /^speed(\d+(?:\.\d+)?)$/.exec(systemName);

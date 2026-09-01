@@ -7,6 +7,7 @@
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "boostercheck": "node --experimental-strip-types --no-warnings src/game/boosterEffects.check.ts",
+    "commercecheck": "node --experimental-strip-types --no-warnings src/game/boosterCommerce.check.ts",
     "netcheck": "node --experimental-strip-types --no-warnings src/game/netclock.check.ts",
     "reconcheck": "node --experimental-strip-types --no-warnings src/game/reconcile.check.ts"
   },

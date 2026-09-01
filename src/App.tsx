@@ -7,6 +7,7 @@ import { sfx } from "./game/audio";
 import { music } from "./game/music";
 import { CONFIG } from "./game/config";
 import {
+  BOOSTERS,
   BOOSTER_MENU_ITEMS,
   GAME_OVER_BOOSTERS,
   INACTIVE_STATION_BOOSTERS,
@@ -19,8 +20,35 @@ import {
 } from "./game/boosters";
 import type { Booster } from "./game/boosters";
 import { getBoosterEffectSystemName } from "./game/boosterEffects";
+import {
+  BOOSTER_INVENTORY_DATA_KEY,
+  EMPTY_BOOSTER_INVENTORY,
+  buildProductBoosterLookup,
+  changeBoosterInventoryCount,
+  creditPurchaseToInventory,
+  getActiveBoosterPromotions,
+  getBoosterProductId,
+  normalizeBoosterInventory,
+  parsePromoFlag,
+} from "./game/boosterCommerce";
+import type {
+  ActiveBoosterPromotions,
+  BoosterInventorySnapshot,
+} from "./game/boosterCommerce";
 import boostersIcon from "./images/boosters/boosters.png";
-import { showFullscreenAd, showRewardedVideoAd } from "./game/yandexGames";
+import {
+  consumeYandexPurchase,
+  getYandexCatalog,
+  getYandexFlags,
+  getYandexPlayerData,
+  getYandexPurchases,
+  getYandexServerTime,
+  purchaseYandexProduct,
+  setYandexPlayerData,
+  showFullscreenAd,
+  showRewardedVideoAd,
+} from "./game/yandexGames";
+import type { YandexCatalogProduct } from "./game/yandexGames";
 import {
   GAME_SERVER_URL,
   MultiplayerClient,
@@ -39,6 +67,29 @@ const boosterIconModules = import.meta.glob("./images/boosters/*.png", {
 const getBoosterIcon = (filename: string) => {
   const path = `./${filename.replace(/\\/g, "/").replace(/^src\//, "")}`;
   return boosterIconModules[path] ?? boostersIcon;
+};
+
+interface CatalogProductView {
+  id: string;
+  price: string;
+  currencyImageUrl: string | null;
+}
+
+interface RecoveredBooster {
+  boosterId: string;
+  count: number;
+}
+
+const BOOSTER_BY_ID = new Map(BOOSTERS.map((booster) => [booster.id, booster]));
+
+const toCatalogProductView = (product: YandexCatalogProduct): CatalogProductView => {
+  let currencyImageUrl: string | null = null;
+  try {
+    currencyImageUrl = product.getPriceCurrencyImage("small");
+  } catch {
+    // Некоторые тестовые каталоги не возвращают иконку валюты.
+  }
+  return { id: product.id, price: product.price, currencyImageUrl };
 };
 
 const fmt = (t: number) => {
@@ -170,6 +221,14 @@ export default function App() {
     boosterId: string;
     timer: number;
   } | null>(null);
+  const inventoryRef = useRef<BoosterInventorySnapshot>({
+    ...EMPTY_BOOSTER_INVENTORY,
+    counts: {},
+  });
+  const inventoryMutationQueue = useRef<Promise<void>>(Promise.resolve());
+  // Платный бустер списан перед отправкой серверу. При явном отказе сервера
+  // возвращаем его в облачный инвентарь.
+  const pendingInAppActivations = useRef(new Map<string, string>());
   const boostersMenuRef = useRef<HTMLDivElement>(null);
 
   const [phase, setPhase] = useState<"loading" | "menu" | "play">("loading");
@@ -187,6 +246,17 @@ export default function App() {
   const [boostersOpen, setBoostersOpen] = useState(false);
   const [boosterBalance, setBoosterBalance] = useState(CONFIG.startMoney);
   const [boosterPurchases, setBoosterPurchases] = useState<Record<string, number>>({});
+  const [inAppPurchases, setInAppPurchases] = useState<Record<string, number>>({});
+  const [boosterInventory, setBoosterInventory] = useState<Record<string, number>>({});
+  const [activePromotions, setActivePromotions] = useState<ActiveBoosterPromotions>({});
+  const [catalogProducts, setCatalogProducts] = useState<Record<string, CatalogProductView>>({});
+  const [commerceStatus, setCommerceStatus] = useState<"loading" | "ready" | "unavailable">(
+    "loading"
+  );
+  const [purchasePending, setPurchasePending] = useState<string | null>(null);
+  const [activationPending, setActivationPending] = useState<string | null>(null);
+  const [recoveredBoosters, setRecoveredBoosters] = useState<RecoveredBooster[]>([]);
+  const [recoveredPurchasesOpen, setRecoveredPurchasesOpen] = useState(false);
   const [inactiveStationNearby, setInactiveStationNearby] = useState(false);
   // Машина заехала на площадку закрытой АЗС: только с такой дистанции сервер
   // принимает активацию, поэтому дальше кнопка бустера заблокирована.
@@ -199,6 +269,132 @@ export default function App() {
     window.clearTimeout(toastTimer.current);
     setToast({ id: Date.now(), msg });
     toastTimer.current = window.setTimeout(() => setToast(null), 2300);
+  };
+
+  const queueInventoryMutation = (mutation: () => Promise<void>): Promise<void> => {
+    const result = inventoryMutationQueue.current.then(mutation, mutation);
+    inventoryMutationQueue.current = result.catch(() => {});
+    return result;
+  };
+
+  const persistInventory = async (inventory: BoosterInventorySnapshot): Promise<void> => {
+    await setYandexPlayerData({ [BOOSTER_INVENTORY_DATA_KEY]: inventory });
+    inventoryRef.current = inventory;
+    setBoosterInventory(inventory.counts);
+  };
+
+  useEffect(() => {
+    let active = true;
+
+    const bootstrapCommerce = async () => {
+      const flagsPromise = getYandexFlags({ PROMO: "[]" }).catch((error: unknown) => {
+        console.error("Не удалось загрузить флаг PROMO:", error);
+        return { PROMO: "[]" };
+      });
+      const timePromise = getYandexServerTime().catch(() => Date.now());
+      const catalogPromise = getYandexCatalog()
+        .then((products) => products.map(toCatalogProductView))
+        .catch((error: unknown) => {
+          console.error("Не удалось загрузить каталог покупок:", error);
+          return null;
+        });
+
+      try {
+        const [flags, now, catalog, playerData, purchases] = await Promise.all([
+          flagsPromise,
+          timePromise,
+          catalogPromise,
+          getYandexPlayerData([BOOSTER_INVENTORY_DATA_KEY]),
+          getYandexPurchases(),
+        ]);
+        const promoItems = parsePromoFlag(flags.PROMO);
+        const promotions = getActiveBoosterPromotions(promoItems, now);
+        const lookup = buildProductBoosterLookup(BOOSTERS, promoItems);
+        let inventory = normalizeBoosterInventory(playerData[BOOSTER_INVENTORY_DATA_KEY]);
+        const recovered = new Map<string, number>();
+
+        // Начисляем и надёжно сохраняем каждый предмет до consumePurchase.
+        // Сохранённые токены не позволяют повторно начислить покупку, если
+        // consume ранее завершился ошибкой.
+        for (const purchase of purchases) {
+          const boosterId = lookup[purchase.productID];
+          if (!boosterId) {
+            console.error("Неизвестная необработанная покупка:", purchase.productID);
+            continue;
+          }
+
+          const credited = creditPurchaseToInventory(
+            inventory,
+            boosterId,
+            purchase.purchaseToken
+          );
+          if (credited.credited) {
+            await setYandexPlayerData({
+              [BOOSTER_INVENTORY_DATA_KEY]: credited.inventory,
+            });
+            inventory = credited.inventory;
+            recovered.set(boosterId, (recovered.get(boosterId) ?? 0) + 1);
+          }
+
+          try {
+            await consumeYandexPurchase(purchase.purchaseToken);
+          } catch (error: unknown) {
+            // Предмет уже сохранён. Токен останется в getPurchases и будет
+            // безопасно обработан повторно при следующем запуске.
+            console.error("Не удалось завершить обработку покупки:", error);
+          }
+        }
+
+        inventoryRef.current = inventory;
+        if (!active) return;
+        setBoosterInventory(inventory.counts);
+        setActivePromotions(promotions);
+        setCatalogProducts(
+          Object.fromEntries((catalog ?? []).map((product) => [product.id, product]))
+        );
+        setCommerceStatus(catalog ? "ready" : "unavailable");
+        const recoveredItems = Array.from(recovered, ([boosterId, count]) => ({
+          boosterId,
+          count,
+        }));
+        setRecoveredBoosters(recoveredItems);
+        setRecoveredPurchasesOpen(recoveredItems.length > 0);
+      } catch (error: unknown) {
+        console.error("Инап-покупки Яндекс Игр недоступны:", error);
+        if (active) setCommerceStatus("unavailable");
+      }
+    };
+
+    void bootstrapCommerce();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const restoreRejectedInAppActivation = (requestId: string): boolean => {
+    const boosterId = pendingInAppActivations.current.get(requestId);
+    if (!boosterId) return false;
+    pendingInAppActivations.current.delete(requestId);
+    setBoosterPurchases((current) => {
+      const count = Math.max(0, (current[boosterId] ?? 0) - 1);
+      const next = { ...current };
+      if (count === 0) delete next[boosterId];
+      else next[boosterId] = count;
+      return next;
+    });
+
+    void queueInventoryMutation(async () => {
+      const restored = changeBoosterInventoryCount(inventoryRef.current, boosterId, 1);
+      if (!restored) return;
+      try {
+        await persistInventory(restored);
+        showToast("Сервер не применил бустер — он возвращён в инвентарь");
+      } catch (error: unknown) {
+        console.error("Не удалось вернуть бустер в инвентарь:", error);
+        showToast("Сервер отклонил бустер. Перезапусти игру для восстановления");
+      }
+    });
+    return true;
   };
 
   useEffect(() => {
@@ -392,7 +588,9 @@ export default function App() {
       onGameEventResult: (result) => {
         const handled = gameRef.current?.applyInteractionResult(result);
         if (result.event === "booster-applied") {
+          const paidActivation = pendingInAppActivations.current.has(result.requestId);
           if (!result.ok) {
+            if (paidActivation) restoreRejectedInAppActivation(result.requestId);
             showToast(
               result.code === "not-enough-money"
                 ? "Не хватило денег на улучшение"
@@ -400,6 +598,7 @@ export default function App() {
             );
             return;
           }
+          if (paidActivation) pendingInAppActivations.current.delete(result.requestId);
           setBoosterBalance(gameRef.current?.getMoney() ?? 0);
           if (result.details?.revived) setGameover(null);
           return;
@@ -423,8 +622,9 @@ export default function App() {
         // а запрос по щиту движок повторит сам.
         let handled = false;
         if (error.requestId) {
+          handled = restoreRejectedInAppActivation(error.requestId);
           resolveStationBooster(error.requestId, false);
-          handled = !!gameRef.current?.applyRequestFailure(error.requestId, error.code);
+          handled = !!gameRef.current?.applyRequestFailure(error.requestId, error.code) || handled;
         }
         if (!handled && networkStatusRef.current === "online") {
           showToast(serverMessage(error.code, error.message));
@@ -450,8 +650,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    gameRef.current?.setPaused(fullscreenAdActive || !!sell);
-  }, [fullscreenAdActive, sell]);
+    gameRef.current?.setPaused(
+      fullscreenAdActive || !!sell || !!purchasePending || recoveredPurchasesOpen
+    );
+  }, [fullscreenAdActive, sell, purchasePending, recoveredPurchasesOpen]);
 
   useEffect(() => {
     if (!boostersOpen) return;
@@ -500,6 +702,8 @@ export default function App() {
     setBoostersOpen(false);
     setBoosterBalance(CONFIG.startMoney);
     setBoosterPurchases({});
+    setInAppPurchases({});
+    pendingInAppActivations.current.clear();
     setInactiveStationNearby(false);
     setInactiveStationInReach(false);
     dropPendingStationBooster();
@@ -517,6 +721,8 @@ export default function App() {
     setBoostersOpen(false);
     setBoosterBalance(CONFIG.startMoney);
     setBoosterPurchases({});
+    setInAppPurchases({});
+    pendingInAppActivations.current.clear();
     setInactiveStationNearby(false);
     setInactiveStationInReach(false);
     dropPendingStationBooster();
@@ -581,9 +787,130 @@ export default function App() {
     });
   };
 
+  const purchaseInAppBooster = async (booster: Booster): Promise<void> => {
+    if (purchasePending || commerceStatus !== "ready") return;
+    const purchasedThisSession = inAppPurchases[booster.id] ?? 0;
+    if (purchasedThisSession >= getMaximumPurchases(booster)) return;
+
+    const productId = getBoosterProductId(booster, activePromotions);
+    if (!catalogProducts[productId]) {
+      showToast("Этот бустер сейчас недоступен в каталоге");
+      return;
+    }
+
+    setPurchasePending(booster.id);
+    gameRef.current?.setPaused(true);
+    try {
+      let purchase;
+      try {
+        purchase = await purchaseYandexProduct(productId);
+      } catch (error: unknown) {
+        console.info("Покупка не завершена:", error);
+        showToast("Покупка не завершена");
+        return;
+      }
+
+      let credited = false;
+      try {
+        await queueInventoryMutation(async () => {
+          const result = creditPurchaseToInventory(
+            inventoryRef.current,
+            booster.id,
+            purchase.purchaseToken
+          );
+          credited = result.credited;
+          if (result.credited) await persistInventory(result.inventory);
+        });
+      } catch (error: unknown) {
+        // Не consume-им оплату: getPurchases вернёт её при следующем запуске.
+        console.error("Оплата прошла, но бустер пока не сохранён:", error);
+        showToast("Оплата сохранена — бустер восстановится при следующем запуске");
+        return;
+      }
+
+      if (credited) {
+        setInAppPurchases((current) => ({
+          ...current,
+          [booster.id]: (current[booster.id] ?? 0) + 1,
+        }));
+      }
+
+      try {
+        await consumeYandexPurchase(purchase.purchaseToken);
+      } catch (error: unknown) {
+        // Предмет уже в облачном инвентаре. Токен останется для безопасной
+        // повторной очистки на следующем старте.
+        console.error("Не удалось завершить обработку покупки:", error);
+      }
+
+      sfx.tick();
+      showToast(
+        `${formatBoosterName(booster.name, CONFIG.startMoney)} добавлен в инвентарь — активируй его отдельно`
+      );
+    } finally {
+      setPurchasePending(null);
+    }
+  };
+
+  const activateInAppBooster = async (booster: Booster): Promise<void> => {
+    const game = gameRef.current;
+    if (!game || activationPending || (inventoryRef.current.counts[booster.id] ?? 0) < 1) {
+      return;
+    }
+
+    setActivationPending(booster.id);
+    let deducted = false;
+    try {
+      await queueInventoryMutation(async () => {
+        const next = changeBoosterInventoryCount(inventoryRef.current, booster.id, -1);
+        if (!next) throw new Error("В инвентаре нет этого бустера");
+        await persistInventory(next);
+        deducted = true;
+      });
+
+      const effect = game.applyBooster(getBoosterEffectSystemName(booster), 0);
+      if (!effect.applied) throw new Error("Игровой эффект бустера не настроен");
+
+      setBoosterPurchases((current) => ({
+        ...current,
+        [booster.id]: (current[booster.id] ?? 0) + 1,
+      }));
+      if (effect.requestId) {
+        pendingInAppActivations.current.set(effect.requestId, booster.id);
+      }
+      if (effect.revived) setGameover(null);
+      setBoosterBalance(game.getMoney());
+      sfx.tick();
+      showToast(
+        effect.revived
+          ? `${formatBoosterName(booster.name, CONFIG.startMoney)} активирован — можно ехать дальше`
+          : `${formatBoosterName(booster.name, CONFIG.startMoney)} активирован`
+      );
+    } catch (error: unknown) {
+      console.error("Не удалось активировать инап-бустер:", error);
+      if (deducted) {
+        try {
+          await queueInventoryMutation(async () => {
+            const restored = changeBoosterInventoryCount(inventoryRef.current, booster.id, 1);
+            if (restored) await persistInventory(restored);
+          });
+        } catch (restoreError: unknown) {
+          console.error("Не удалось вернуть бустер после ошибки активации:", restoreError);
+        }
+      }
+      showToast("Не удалось активировать бустер — он остался в инвентаре");
+    } finally {
+      setActivationPending(null);
+    }
+  };
+
   const buyBooster = (booster: Booster, videoCompleted = false): void => {
     const game = gameRef.current;
     if (!game) return;
+    if (booster.sales_method === "In-app purchase") {
+      void purchaseInAppBooster(booster);
+      return;
+    }
     const balance = game.getMoney();
     if (!isBoosterAvailable(booster, boosterPurchases, balance, CONFIG.startMoney)) return;
 
@@ -801,6 +1128,156 @@ export default function App() {
           ];
   const playerLeaderboardEntry = playerLeaderboardIndex >= 0 ? leaderboard[playerLeaderboardIndex] : null;
   const maxSellLiters = sell ? floorTenth(sell.fuel / 2) : 0;
+  const totalInAppInventory = Object.values(boosterInventory).reduce(
+    (total, count) => total + count,
+    0
+  );
+
+  const renderBoosterCard = (booster: Booster, surface: "menu" | "gameover") => {
+    const purchased = boosterPurchases[booster.id] ?? 0;
+    const maximum = getMaximumPurchases(booster);
+    const backgroundClass = surface === "gameover" ? "bg-night-900/80" : "bg-night-800/95";
+
+    if (booster.sales_method === "In-app purchase") {
+      const inventoryCount = boosterInventory[booster.id] ?? 0;
+      const purchasedThisSession = inAppPurchases[booster.id] ?? 0;
+      const promotion = activePromotions[booster.system_name];
+      const productId = getBoosterProductId(booster, activePromotions);
+      const product = catalogProducts[productId];
+      const isBuying = purchasePending === booster.id;
+      const isActivating = activationPending === booster.id;
+      const purchaseLimitReached = purchasedThisSession >= maximum;
+      const canBuy =
+        commerceStatus === "ready" &&
+        !!product &&
+        !purchasePending &&
+        !purchaseLimitReached;
+      const canActivate = inventoryCount > 0 && !activationPending;
+      const purchaseLabel = isBuying
+        ? "Открываем оплату…"
+        : purchaseLimitReached
+          ? "Лимит покупок"
+          : commerceStatus === "loading"
+            ? "Загружаем цену…"
+            : product
+              ? `Купить · ${product.price}`
+              : "Нет в каталоге";
+
+      return (
+        <div
+          key={booster.id}
+          className={`flex min-h-[104px] w-full flex-col gap-2 rounded-lg border border-night-600 ${backgroundClass} p-2 shadow-[0_7px_18px_rgba(0,0,0,0.28)]`}
+        >
+          <div className="flex items-center gap-3">
+            <img
+              src={getBoosterIcon(booster.icon_filename)}
+              alt=""
+              className="h-12 w-12 shrink-0 rounded-lg border border-night-600 object-cover shadow-inner"
+            />
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-1.5 font-display text-sm leading-tight text-[#f2ecdf]">
+                <span>{formatBoosterName(booster.name, CONFIG.startMoney)}</span>
+                {promotion && (
+                  <span className="rounded bg-[#ff6b5a]/15 px-1.5 py-0.5 text-[9px] tracking-wide text-[#ff8a72]">
+                    {promotion.discountPercent ? `АКЦИЯ −${promotion.discountPercent}%` : "АКЦИЯ"}
+                  </span>
+                )}
+              </div>
+              <div className="mt-1 text-[10px] leading-snug text-slate-500">
+                Покупка попадёт в инвентарь и не включится сама.
+              </div>
+            </div>
+            <div className="shrink-0 rounded-md border border-aqua-glow/25 bg-aqua-glow/10 px-2 py-1 text-center">
+              <div className="text-[8px] uppercase tracking-wide text-slate-500">в запасе</div>
+              <div className="font-display text-sm tabular-nums text-aqua-glow">{inventoryCount}</div>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              disabled={!canBuy}
+              onClick={() => void purchaseInAppBooster(booster)}
+              className="flex min-h-9 items-center justify-center gap-1.5 rounded-md border border-[#ffd27a]/35 bg-[#ffd27a]/10 px-2 text-[10px] font-bold text-[#ffd27a] transition-colors enabled:hover:border-[#ffd27a]/70 enabled:hover:bg-[#ffd27a]/15 disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              {product?.currencyImageUrl && !isBuying && !purchaseLimitReached && (
+                <img src={product.currencyImageUrl} alt="" className="h-4 w-4 object-contain" />
+              )}
+              <span>{purchaseLabel}</span>
+            </button>
+            <button
+              type="button"
+              disabled={!canActivate}
+              onClick={() => void activateInAppBooster(booster)}
+              className="min-h-9 rounded-md bg-aqua-glow px-2 text-[10px] font-bold text-night-950 transition-all enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              {isActivating ? "Активируем…" : "Активировать"}
+            </button>
+          </div>
+          <div className="px-0.5 text-[9px] text-slate-600">
+            Покупок в этом заезде: {purchasedThisSession}/{maximum}
+          </div>
+        </div>
+      );
+    }
+
+    const cost = calculateBoosterCost(booster, CONFIG.startMoney);
+    const available = isBoosterAvailable(
+      booster,
+      boosterPurchases,
+      boosterBalance,
+      CONFIG.startMoney
+    );
+    const parent = booster.parent_booster
+      ? BOOSTER_MENU_ITEMS.find((item) => item.id === booster.parent_booster)
+      : undefined;
+
+    let status: string;
+    if (purchased >= maximum) {
+      status = "Лимит исчерпан";
+    } else if (parent && (boosterPurchases[parent.id] ?? 0) < 1) {
+      status = `Сначала: ${formatBoosterName(parent.name, CONFIG.startMoney)}`;
+    } else if (booster.sales_method === "In-game currency") {
+      status = !Number.isFinite(cost)
+        ? "Цена не настроена"
+        : boosterBalance >= cost
+          ? `${fmtMoney(cost)} ₽`
+          : `Не хватает ${fmtMoney(cost - boosterBalance)} ₽`;
+    } else if (booster.sales_method === "Video advertising") {
+      status = "Просмотреть видео и получить";
+    } else {
+      status = `${booster.sales_method} · заглушка`;
+    }
+
+    return (
+      <button
+        key={booster.id}
+        type="button"
+        disabled={!available}
+        onClick={() => buyBooster(booster)}
+        className={`group/item flex min-h-[66px] w-full items-center gap-3 rounded-lg border border-night-600 ${backgroundClass} p-2 text-left shadow-[0_7px_18px_rgba(0,0,0,0.28)] transition-all enabled:hover:-translate-y-0.5 enabled:hover:border-amber-glow/60 enabled:hover:bg-[#182238] enabled:active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-45`}
+      >
+        <img
+          src={getBoosterIcon(booster.icon_filename)}
+          alt=""
+          className="h-12 w-12 shrink-0 rounded-lg border border-night-600 object-cover shadow-inner"
+        />
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-1.5 font-display text-sm leading-tight text-[#f2ecdf] group-enabled/item:group-hover/item:text-amber-glow">
+            <span>{formatBoosterName(booster.name, CONFIG.startMoney)}</span>
+            {booster.sales_method === "Video advertising" && (
+              <span role="img" aria-label="Видео-реклама" title="Видео-реклама">
+                🎥
+              </span>
+            )}
+          </span>
+          <span className="mt-1 block text-[10px] leading-tight text-slate-500">{status}</span>
+        </span>
+        <span className="shrink-0 self-start rounded bg-night-950/70 px-1.5 py-1 text-[9px] tabular-nums text-slate-500">
+          {purchased}/{maximum}
+        </span>
+      </button>
+    );
+  };
 
   return (
     <div className="fixed inset-0 overflow-hidden bg-night-900 no-select text-slate-200">
@@ -953,7 +1430,7 @@ export default function App() {
       {phase === "play" && (
         <>
           {/* левый верх: прокачка, время и касса */}
-          <div className="absolute top-4 left-4 z-10 pointer-events-none flex flex-col items-start gap-2">
+          <div className="absolute top-4 left-4 z-30 pointer-events-none flex flex-col items-start gap-2">
             <div ref={boostersMenuRef} className="pointer-events-auto relative">
               <button
                 type="button"
@@ -962,8 +1439,13 @@ export default function App() {
                 aria-controls="boosters-menu"
                 className="group flex items-center gap-2.5 rounded-lg pr-2 text-left transition-transform hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-glow/80"
               >
-                <span className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-night-600 bg-night-900/85 shadow-[0_8px_24px_rgba(0,0,0,0.4)] transition-colors group-hover:border-amber-glow/60">
+                <span className="relative flex h-11 w-11 shrink-0 items-center justify-center overflow-visible rounded-lg border border-night-600 bg-night-900/85 shadow-[0_8px_24px_rgba(0,0,0,0.4)] transition-colors group-hover:border-amber-glow/60">
                   <img src={boostersIcon} alt="" className="h-full w-full object-cover" />
+                  {totalInAppInventory > 0 && (
+                    <span className="absolute -right-1.5 -top-1.5 flex h-5 min-w-5 items-center justify-center rounded-full border border-night-900 bg-aqua-glow px-1 text-[9px] font-bold text-night-950 shadow-md">
+                      {totalInAppInventory}
+                    </span>
+                  )}
                 </span>
                 <span className="font-display text-xs tracking-[0.12em] text-[#f2ecdf] transition-colors group-hover:text-amber-glow">
                   ПРОКАЧКА
@@ -997,76 +1479,13 @@ export default function App() {
                       </div>
                     </div>
                     <div className="mt-1 text-[10px] leading-snug text-slate-500">
-                      Покупки и зависимости действуют до конца текущего заезда.
+                      Платные бустеры сначала попадают в инвентарь. Чтобы получить эффект,
+                      нажми «Активировать».
                     </div>
                   </div>
 
                   <div className="flex flex-col gap-2">
-                    {BOOSTER_MENU_ITEMS.map((booster) => {
-                      const purchased = boosterPurchases[booster.id] ?? 0;
-                      const maximum = getMaximumPurchases(booster);
-                      const cost = calculateBoosterCost(booster, CONFIG.startMoney);
-                      const available = isBoosterAvailable(
-                        booster,
-                        boosterPurchases,
-                        boosterBalance,
-                        CONFIG.startMoney
-                      );
-                      const parent = booster.parent_booster
-                        ? BOOSTER_MENU_ITEMS.find((item) => item.id === booster.parent_booster)
-                        : undefined;
-
-                      let status: string;
-                      if (purchased >= maximum) {
-                        status = "Лимит исчерпан";
-                      } else if (parent && (boosterPurchases[parent.id] ?? 0) < 1) {
-                        status = `Сначала: ${formatBoosterName(parent.name, CONFIG.startMoney)}`;
-                      } else if (booster.sales_method === "In-game currency") {
-                        status = !Number.isFinite(cost)
-                          ? "Цена не настроена"
-                          : boosterBalance >= cost
-                            ? `${fmtMoney(cost)} ₽`
-                            : `Не хватает ${fmtMoney(cost - boosterBalance)} ₽`;
-                      } else if (booster.sales_method === "In-app purchase") {
-                        status = "Покупка в приложении · заглушка";
-                      } else if (booster.sales_method === "Video advertising") {
-                        status = "Просмотреть видео и получить";
-                      } else {
-                        status = `${booster.sales_method} · заглушка`;
-                      }
-
-                      return (
-                        <button
-                          key={booster.id}
-                          type="button"
-                          disabled={!available}
-                          onClick={() => buyBooster(booster)}
-                          className="group/item flex min-h-[66px] w-full items-center gap-3 rounded-lg border border-night-600 bg-night-800/95 p-2 text-left shadow-[0_7px_18px_rgba(0,0,0,0.28)] transition-all enabled:hover:-translate-y-0.5 enabled:hover:border-amber-glow/60 enabled:hover:bg-[#182238] enabled:active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-45"
-                        >
-                          <img
-                            src={getBoosterIcon(booster.icon_filename)}
-                            alt=""
-                            className="h-12 w-12 shrink-0 rounded-lg border border-night-600 object-cover shadow-inner disabled:grayscale"
-                          />
-                          <span className="min-w-0 flex-1">
-                            <span className="flex items-center gap-1.5 font-display text-sm leading-tight text-[#f2ecdf] group-enabled/item:group-hover/item:text-amber-glow">
-                              <span>{formatBoosterName(booster.name, CONFIG.startMoney)}</span>
-                              {booster.sales_method === "Video advertising" && (
-                                <span role="img" aria-label="Видео-реклама" title="Видео-реклама">
-                                  🎥
-                                </span>
-                              )}
-                            </span>
-                            <span className="mt-1 block text-[10px] leading-tight text-slate-500">
-                              {status}
-                            </span>
-                          </span>
-                          <span className="shrink-0 self-start rounded bg-night-950/70 px-1.5 py-1 text-[9px] tabular-nums text-slate-500">
-                            {purchased}/{maximum}
-                          </span>
-                        </button>
-                      );
-                    })}
+                    {BOOSTER_MENU_ITEMS.map((booster) => renderBoosterCard(booster, "menu"))}
                   </div>
                 </div>
               )}
@@ -1552,6 +1971,69 @@ export default function App() {
         </div>
       )}
 
+      {/* Покупки, завершившиеся без ответа приложения, восстанавливаются на старте. */}
+      {recoveredPurchasesOpen && recoveredBoosters.length > 0 && (
+        <div className="absolute inset-0 z-[120] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-[rgba(5,8,16,0.78)] backdrop-blur-[4px] anim-fade" />
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="recovered-purchases-title"
+            className="relative max-h-[calc(100vh-2rem)] w-full max-w-md overflow-y-auto rounded-xl border border-aqua-glow/35 bg-night-800 p-6 shadow-[0_30px_90px_rgba(0,0,0,0.72)] anim-pop"
+          >
+            <div className="flex h-12 w-12 items-center justify-center rounded-xl border border-aqua-glow/30 bg-aqua-glow/10 text-2xl">
+              ✓
+            </div>
+            <h2
+              id="recovered-purchases-title"
+              className="mt-4 font-display text-2xl leading-tight text-[#f2ecdf]"
+            >
+              Покупки восстановлены
+            </h2>
+            <p className="mt-2 text-sm leading-relaxed text-slate-400">
+              Мы нашли покупки, которые завершились, пока игра была офлайн. Бустеры уже
+              зачислены в твой инвентарь — они не активируются автоматически.
+            </p>
+
+            <div className="mt-5 flex flex-col gap-2">
+              {recoveredBoosters.map(({ boosterId, count }) => {
+                const booster = BOOSTER_BY_ID.get(boosterId);
+                if (!booster) return null;
+                return (
+                  <div
+                    key={boosterId}
+                    className="flex items-center gap-3 rounded-lg border border-night-600 bg-night-900/75 p-2.5"
+                  >
+                    <img
+                      src={getBoosterIcon(booster.icon_filename)}
+                      alt=""
+                      className="h-12 w-12 rounded-lg border border-night-600 object-cover"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="font-display text-sm text-[#f2ecdf]">
+                        {formatBoosterName(booster.name, CONFIG.startMoney)}
+                      </div>
+                      <div className="mt-1 text-[10px] text-aqua-glow">Теперь в инвентаре</div>
+                    </div>
+                    <div className="rounded-md bg-aqua-glow/10 px-2.5 py-1 font-display text-sm text-aqua-glow">
+                      ×{count}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setRecoveredPurchasesOpen(false)}
+              className="mt-6 w-full rounded-md bg-aqua-glow px-6 py-3.5 font-display text-sm tracking-wide text-night-950 transition-all hover:brightness-110"
+            >
+              Понятно, открыть инвентарь позже
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ================= победа ================= */}
       {win && (
         <div className="absolute inset-0 z-30 flex items-center justify-center p-4">
@@ -1630,71 +2112,9 @@ export default function App() {
                   БУСТЕРЫ
                 </div>
                 <div className="flex flex-col gap-2">
-                  {GAME_OVER_BOOSTERS.map((booster) => {
-                    const purchased = boosterPurchases[booster.id] ?? 0;
-                    const maximum = getMaximumPurchases(booster);
-                    const cost = calculateBoosterCost(booster, CONFIG.startMoney);
-                    const available = isBoosterAvailable(
-                      booster,
-                      boosterPurchases,
-                      boosterBalance,
-                      CONFIG.startMoney
-                    );
-                    const parent = booster.parent_booster
-                      ? BOOSTER_MENU_ITEMS.find((item) => item.id === booster.parent_booster)
-                      : undefined;
-
-                    let status: string;
-                    if (purchased >= maximum) {
-                      status = "Лимит исчерпан";
-                    } else if (parent && (boosterPurchases[parent.id] ?? 0) < 1) {
-                      status = `Сначала: ${formatBoosterName(parent.name, CONFIG.startMoney)}`;
-                    } else if (booster.sales_method === "In-game currency") {
-                      status = !Number.isFinite(cost)
-                        ? "Цена не настроена"
-                        : boosterBalance >= cost
-                          ? `${fmtMoney(cost)} ₽`
-                          : `Не хватает ${fmtMoney(cost - boosterBalance)} ₽`;
-                    } else if (booster.sales_method === "In-app purchase") {
-                      status = "Покупка в приложении · заглушка";
-                    } else if (booster.sales_method === "Video advertising") {
-                      status = "Просмотреть видео и получить";
-                    } else {
-                      status = `${booster.sales_method} · заглушка`;
-                    }
-
-                    return (
-                      <button
-                        key={booster.id}
-                        type="button"
-                        disabled={!available}
-                        onClick={() => buyBooster(booster)}
-                        className="group/gameover-booster flex min-h-[66px] w-full items-center gap-3 rounded-lg border border-night-600 bg-night-900/80 p-2 text-left shadow-[0_7px_18px_rgba(0,0,0,0.28)] transition-all enabled:hover:-translate-y-0.5 enabled:hover:border-[#ff8a72]/70 enabled:hover:bg-[#182238] enabled:active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-45"
-                      >
-                        <img
-                          src={getBoosterIcon(booster.icon_filename)}
-                          alt=""
-                          className="h-12 w-12 shrink-0 rounded-lg border border-night-600 object-cover shadow-inner"
-                        />
-                        <span className="min-w-0 flex-1">
-                          <span className="flex items-center gap-1.5 font-display text-sm leading-tight text-[#f2ecdf]">
-                            <span>{formatBoosterName(booster.name, CONFIG.startMoney)}</span>
-                            {booster.sales_method === "Video advertising" && (
-                              <span role="img" aria-label="Видео-реклама" title="Видео-реклама">
-                                🎥
-                              </span>
-                            )}
-                          </span>
-                          <span className="mt-1 block text-[10px] leading-tight text-slate-500">
-                            {status}
-                          </span>
-                        </span>
-                        <span className="shrink-0 self-start rounded bg-night-950/70 px-1.5 py-1 text-[9px] tabular-nums text-slate-500">
-                          {purchased}/{maximum}
-                        </span>
-                      </button>
-                    );
-                  })}
+                  {GAME_OVER_BOOSTERS.map((booster) =>
+                    renderBoosterCard(booster, "gameover")
+                  )}
                 </div>
               </div>
             )}

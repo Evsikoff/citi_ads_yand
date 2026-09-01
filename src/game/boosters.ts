@@ -26,7 +26,7 @@ const MENU_DISPLAY_METHODS = new Set([
   "Game Over Screen and Booster menu",
 ]);
 
-const BOOSTERS = boosterData as Booster[];
+export const BOOSTERS = boosterData as Booster[];
 
 export const BOOSTER_MENU_ITEMS = BOOSTERS.filter((booster) =>
   MENU_DISPLAY_METHODS.has(booster.display_method)
@@ -153,17 +153,14 @@ export function isBoosterAvailable(
   return true;
 }
 
-/** Заглушки внешних интеграций, кроме подключённой видеорекламы. */
-export function executeInAppPurchaseStub(_booster: Booster): boolean {
-  return true;
-}
-
 export function executeOtherSaleMethodStub(_booster: Booster): boolean {
   return true;
 }
 
 export function executeExternalBoosterSale(booster: Booster): boolean {
-  if (booster.sales_method === "In-app purchase") return executeInAppPurchaseStub(booster);
+  // Инап асинхронно обрабатывается магазином и никогда не должен проходить
+  // через синхронный fallback, который сразу включает эффект.
+  if (booster.sales_method === "In-app purchase") return false;
   // Видеореклама асинхронна и обрабатывается через showRewardedVideoAd перед
   // выдачей бустера. Не разрешаем случайно обойти её синхронной заглушкой.
   if (booster.sales_method === "Video advertising") return false;

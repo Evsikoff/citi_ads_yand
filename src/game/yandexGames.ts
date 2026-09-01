@@ -8,11 +8,48 @@ export interface RewardedVideoAdCallbacks extends FullscreenAdCallbacks {
   onRewarded?(): void;
 }
 
+export interface YandexCatalogProduct {
+  id: string;
+  title: string;
+  description: string;
+  imageURI: string;
+  price: string;
+  priceValue: string;
+  priceCurrencyCode: string;
+  getPriceCurrencyImage(size?: "small" | "medium" | "svg"): string;
+}
+
+export interface YandexPurchase {
+  productID: string;
+  purchaseToken: string;
+  developerPayload?: string;
+}
+
+interface YandexPayments {
+  getCatalog(): Promise<YandexCatalogProduct[]>;
+  getPurchases(): Promise<YandexPurchase[]>;
+  purchase(data: { id: string; developerPayload?: string }): Promise<YandexPurchase>;
+  consumePurchase(purchaseToken: string): Promise<void>;
+}
+
+interface YandexPlayer {
+  getData(keys?: string[]): Promise<Record<string, unknown>>;
+  setData(data: Record<string, unknown>, flush?: boolean): Promise<void>;
+}
+
 interface YandexGamesSdk {
   adv: {
     showFullscreenAdv(options?: { callbacks?: FullscreenAdCallbacks }): void;
     showRewardedVideo(options?: { callbacks?: RewardedVideoAdCallbacks }): void;
   };
+  payments: YandexPayments;
+  getPayments(options?: { signed?: boolean }): Promise<YandexPayments>;
+  getFlags(options?: {
+    defaultFlags?: Record<string, string>;
+    clientFeatures?: Array<{ name: string; value: string }>;
+  }): Promise<Record<string, string>> | Record<string, string>;
+  getPlayer(options?: { signed?: boolean }): Promise<YandexPlayer>;
+  serverTime?(): number;
 }
 
 interface YandexGamesGlobal {
@@ -27,6 +64,7 @@ declare global {
 
 let sdk: YandexGamesSdk | null = null;
 let sdkInitialization: Promise<YandexGamesSdk | null> | null = null;
+let playerInitialization: Promise<YandexPlayer> | null = null;
 
 /** Инициализирует SDK один раз при запуске приложения. */
 export function initYandexGamesSdk(): Promise<YandexGamesSdk | null> {
@@ -51,6 +89,69 @@ export function initYandexGamesSdk(): Promise<YandexGamesSdk | null> {
     });
 
   return sdkInitialization;
+}
+
+async function requireYandexGamesSdk(): Promise<YandexGamesSdk> {
+  const initializedSdk = sdk ?? (await initYandexGamesSdk());
+  if (!initializedSdk) throw new Error("SDK Яндекс Игр недоступен");
+  return initializedSdk;
+}
+
+async function getYandexPlayer(): Promise<YandexPlayer> {
+  if (playerInitialization) return playerInitialization;
+  playerInitialization = requireYandexGamesSdk()
+    .then((initializedSdk) => initializedSdk.getPlayer())
+    .catch((error: unknown) => {
+      playerInitialization = null;
+      throw error;
+    });
+  return playerInitialization;
+}
+
+/** Читает строковые флаги Remote Config. */
+export async function getYandexFlags(
+  defaultFlags: Record<string, string> = {}
+): Promise<Record<string, string>> {
+  const initializedSdk = await requireYandexGamesSdk();
+  return initializedSdk.getFlags({ defaultFlags });
+}
+
+/** Возвращает серверное время SDK, если оно доступно. */
+export async function getYandexServerTime(): Promise<number> {
+  const initializedSdk = await requireYandexGamesSdk();
+  const value = initializedSdk.serverTime?.();
+  return typeof value === "number" && Number.isFinite(value) ? value : Date.now();
+}
+
+export async function getYandexCatalog(): Promise<YandexCatalogProduct[]> {
+  const initializedSdk = await requireYandexGamesSdk();
+  return initializedSdk.payments.getCatalog();
+}
+
+export async function getYandexPurchases(): Promise<YandexPurchase[]> {
+  const initializedSdk = await requireYandexGamesSdk();
+  return initializedSdk.payments.getPurchases();
+}
+
+export async function purchaseYandexProduct(productId: string): Promise<YandexPurchase> {
+  const initializedSdk = await requireYandexGamesSdk();
+  return initializedSdk.payments.purchase({ id: productId });
+}
+
+export async function consumeYandexPurchase(purchaseToken: string): Promise<void> {
+  const initializedSdk = await requireYandexGamesSdk();
+  await initializedSdk.payments.consumePurchase(purchaseToken);
+}
+
+export async function getYandexPlayerData(keys: string[]): Promise<Record<string, unknown>> {
+  const player = await getYandexPlayer();
+  return player.getData(keys);
+}
+
+/** Сохраняет инвентарь немедленно: только после этого покупку можно consume-ить. */
+export async function setYandexPlayerData(data: Record<string, unknown>): Promise<void> {
+  const player = await getYandexPlayer();
+  await player.setData(data, true);
 }
 
 /** Показывает межстраничную рекламу после готовности SDK. */
