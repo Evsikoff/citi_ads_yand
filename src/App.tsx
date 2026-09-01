@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { CLIENTS } from "./game/clients";
-import type { Client } from "./game/clients";
 import { CityRideGame } from "./game/engine";
 import type { HudData, LeaderboardEntry } from "./game/engine";
 import { sfx } from "./game/audio";
@@ -19,8 +18,8 @@ import {
   isBoosterWithinSessionLimit,
 } from "./game/boosters";
 import type { Booster } from "./game/boosters";
-import { ClientModal } from "./components/ClientModal";
 import boostersIcon from "./images/boosters/boosters.png";
+import { showFullscreenAd } from "./game/yandexGames";
 import {
   GAME_SERVER_URL,
   MultiplayerClient,
@@ -163,6 +162,7 @@ export default function App() {
   const refuelPriceRef = useRef<HTMLSpanElement>(null);
   const refuelLimitRef = useRef<HTMLSpanElement>(null);
   const toastTimer = useRef<number>(0);
+  const fullscreenAdRequest = useRef(false);
   // Активация АЗС, отправленная на сервер: пока ответа нет, бустер не потрачен.
   const pendingStationBooster = useRef<{
     requestId: string;
@@ -173,7 +173,7 @@ export default function App() {
 
   const [phase, setPhase] = useState<"loading" | "menu" | "play">("loading");
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
-  const [modal, setModal] = useState<{ client: Client; index: number } | null>(null);
+  const [fullscreenAdActive, setFullscreenAdActive] = useState(false);
   const [muted, setMuted] = useState(false);
   const [musicOn, setMusicOn] = useState(music.isEnabled);
   const [win, setWin] = useState<{ time: number; top: number } | null>(null);
@@ -249,8 +249,47 @@ export default function App() {
         if (lowRef.current) lowRef.current.style.display = !h.refueling && fr < 0.22 && f > 0 ? "inline" : "none";
       },
       onLeaderboard: setLeaderboard,
-      onDiscover: (client, index) => {
-        setModal({ client, index });
+      onBillboardAd: (_client, _index, complete) => {
+        if (fullscreenAdRequest.current) {
+          complete(true);
+          return;
+        }
+
+        fullscreenAdRequest.current = true;
+        gameRef.current?.setPaused(true);
+        setFullscreenAdActive(true);
+        const effectsWereMuted = sfx.muted;
+        const musicWasEnabled = music.isEnabled;
+        let finished = false;
+
+        const finish = (message?: string) => {
+          if (finished) return;
+          finished = true;
+          fullscreenAdRequest.current = false;
+          setFullscreenAdActive(false);
+          sfx.setMuted(effectsWereMuted);
+          if (musicWasEnabled) music.play();
+          // Вне Яндекс Игр, при ошибке SDK и при ограничении частоты реклама
+          // недоступна. В этих случаях билборд всё равно должен сработать.
+          complete(true);
+          if (message) showToast(message);
+        };
+
+        void showFullscreenAd({
+          onOpen: () => {
+            sfx.setMuted(true);
+            music.stop();
+            console.info("Полноэкранная реклама открыта");
+          },
+          onClose: (wasShown) => {
+            console.info("Полноэкранная реклама закрыта, показана:", wasShown);
+            finish(wasShown ? undefined : "Реклама недоступна — билборд засчитан без показа");
+          },
+          onError: (error) => {
+            console.error("Ошибка показа полноэкранной рекламы:", error);
+            finish("Реклама недоступна — билборд засчитан без показа");
+          },
+        });
       },
       onWin: (stats) => setWin(stats),
       onGameOver: (stats) => setGameover(stats),
@@ -409,8 +448,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    gameRef.current?.setPaused(!!modal || !!sell);
-  }, [modal, sell]);
+    gameRef.current?.setPaused(fullscreenAdActive || !!sell);
+  }, [fullscreenAdActive, sell]);
 
   useEffect(() => {
     if (!boostersOpen) return;
@@ -470,7 +509,7 @@ export default function App() {
     const game = gameRef.current;
     if (!game?.requestOnlineRespawn()) game?.reset();
     setWin(null);
-    setModal(null);
+    setFullscreenAdActive(false);
     setGameover(null);
     setMapOpen(false);
     setBoostersOpen(false);
@@ -617,7 +656,7 @@ export default function App() {
           restart();
         }
       }
-      if (e.code === "KeyM" && phase === "play" && !modal && !sell && !win && !gameover) {
+      if (e.code === "KeyM" && phase === "play" && !fullscreenAdActive && !sell && !win && !gameover) {
         e.preventDefault();
         setMapOpen((open) => !open);
       }
@@ -627,7 +666,7 @@ export default function App() {
         phase === "play" &&
         inactiveStationNearby &&
         INACTIVE_STATION_BOOSTERS.length === 1 &&
-        !modal &&
+        !fullscreenAdActive &&
         !sell &&
         !win &&
         !gameover &&
@@ -636,12 +675,11 @@ export default function App() {
         e.preventDefault();
         activateInactiveStationBooster(INACTIVE_STATION_BOOSTERS[0]);
       }
-      if (e.code === "KeyV") toggleMute();
-      if (e.code === "KeyB") toggleMusic();
+      if (e.code === "KeyV" && !fullscreenAdActive) toggleMute();
+      if (e.code === "KeyB" && !fullscreenAdActive) toggleMusic();
       if (e.code === "Escape") {
         if (boostersOpen) setBoostersOpen(false);
         else if (mapOpen) setMapOpen(false);
-        else if (modal) setModal(null);
         else if (win) setWin(null);
       }
     };
@@ -650,7 +688,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     phase,
-    modal,
+    fullscreenAdActive,
     sell,
     win,
     gameover,
@@ -1283,7 +1321,7 @@ export default function App() {
           )}
 
           {/* сенсорные кнопки */}
-          {touch && !modal && (
+          {touch && !fullscreenAdActive && (
             <div className="absolute bottom-24 inset-x-5 z-20 flex justify-between items-end">
               <div className="flex gap-3">
                 <button {...hold("left")} className="w-16 h-16 rounded-full bg-night-800/85 border border-night-600 text-amber-glow flex items-center justify-center active:bg-night-600 touch-none">
@@ -1669,15 +1707,6 @@ export default function App() {
         </div>
       )}
 
-      {/* ================= лендинг клиента ================= */}
-      {modal && (
-        <ClientModal
-          client={modal.client}
-          index={modal.index}
-          total={CLIENTS.length}
-          onClose={() => setModal(null)}
-        />
-      )}
     </div>
   );
 }

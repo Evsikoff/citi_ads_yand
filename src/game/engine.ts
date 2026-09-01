@@ -56,7 +56,7 @@ export interface LeaderboardEntry {
 export interface GameCallbacks {
   onHud(h: HudData): void;
   onLeaderboard(entries: LeaderboardEntry[]): void;
-  onDiscover(client: Client, index: number): void;
+  onBillboardAd(client: Client, index: number, complete: (wasShown: boolean) => void): void;
   onWin(stats: { time: number; top: number }): void;
   onGameOver(stats: { time: number; found: number }): void;
   onBillboardUnavailable(): void;
@@ -327,6 +327,10 @@ export class CityRideGame {
   // Запросы по щитам, отправленные серверу: requestId → id щита. Пока ответа
   // нет, повторно тот же щит не дёргаем.
   private billboardRequests = new Map<string, string>();
+  // Пока полноэкранная реклама открывается или показывается, другие щиты не
+  // запускают новый рекламный запрос.
+  private billboardAdActive = false;
+  private billboardAdToken = 0;
   // Щиты, по которым сервер ответил «too-far»: ждём паузу и пробуем снова, не
   // сходя с места. Значение — сколько секунд осталось ждать.
   private billboardRetry = new Map<string, number>();
@@ -712,7 +716,7 @@ export class CityRideGame {
   }
 
   /**
-   * Ответ по рекламному щиту. Карточку клиента и таймаут показываем только на
+   * Ответ по рекламному щиту. Эффекты и таймаут показываем только на
    * подтверждение сервера: раньше клиент рисовал их сразу после отправки, и
    * отказ выглядел как сработавшее взаимодействие, после которого ничего не
    * происходит. Отказ «too-far» не окончательный — сервер мерил по устаревшей
@@ -730,6 +734,8 @@ export class CityRideGame {
         this.billboardRetry.set(id, BILLBOARD_RETRY_DELAY);
         return true;
       }
+      this.billboardAttempts.delete(id);
+      this.billboardRetry.delete(id);
       if (code === "all-stations-active") {
         this.cb.onBillboardUnavailable();
         return true;
@@ -753,7 +759,6 @@ export class CityRideGame {
       this.spawn(cx, cy, "confetti", colors[i % colors.length], 0.95, 330);
     }
     sfx.chime();
-    this.cb.onDiscover(billboard.client, this.city.billboards.indexOf(billboard) + 1);
     return true;
   }
 
@@ -925,6 +930,7 @@ export class CityRideGame {
     this.refuelStation = null;
     this.usedStation = null;
     this.billboardContact = null;
+    this.cancelBillboardAd();
     this.onlineContacts.clear();
     this.forgetBillboardRequests();
     this.afterObjectsChanged();
@@ -1174,6 +1180,7 @@ export class CityRideGame {
     this.knock.y = 0;
     this.deadPointers = [];
     this.billboardContact = null;
+    this.cancelBillboardAd();
     for (const k of this.city.canisters) {
       k.taken = false;
       k.cool = 0;
@@ -1420,13 +1427,14 @@ export class CityRideGame {
       // Ответа по этому щиту ещё нет либо ждём паузу перед повтором.
       if (this.billboardRetry.has(id)) continue;
       if (this.onlineContacts.has(key) || billboard.state !== "ready") continue;
-      // Занята ли ещё хоть одна АЗС, решает сервер: у него состояние заправок
-      // свежее нашего, а отказ он объяснит кодом all-stations-active.
-      this.pushPositionToServer();
-      const requestId = transport.interact("billboard", id);
-      if (!requestId) continue;
-      this.billboardRequests.set(requestId, id);
-      this.billboardAttempts.set(id, (this.billboardAttempts.get(id) ?? 0) + 1);
+      // После too-far повторяем только серверный запрос: реклама уже была
+      // просмотрена и не должна открываться ещё раз из-за сетевой рассинхронизации.
+      if (this.billboardAttempts.has(id)) this.sendBillboardInteraction(id);
+      else {
+        this.requestBillboardAd(billboard, (wasShown) => {
+          if (wasShown) this.sendBillboardInteraction(id);
+        });
+      }
     }
 
     const base = this.city.base;
@@ -1455,6 +1463,48 @@ export class CityRideGame {
     this.billboardRequests.clear();
     this.billboardRetry.clear();
     this.billboardAttempts.clear();
+  }
+
+  private requestBillboardAd(
+    billboard: Billboard,
+    complete: (wasShown: boolean) => void
+  ): void {
+    if (this.billboardAdActive) return;
+    this.billboardAdActive = true;
+    const token = ++this.billboardAdToken;
+    const finish = (wasShown: boolean) => {
+      if (token !== this.billboardAdToken) return;
+      this.billboardAdActive = false;
+      complete(wasShown);
+    };
+
+    try {
+      this.cb.onBillboardAd(
+        billboard.client,
+        this.city.billboards.indexOf(billboard) + 1,
+        finish
+      );
+    } catch {
+      finish(false);
+    }
+  }
+
+  private cancelBillboardAd(): void {
+    this.billboardAdToken += 1;
+    this.billboardAdActive = false;
+  }
+
+  private sendBillboardInteraction(id: string): void {
+    const activeTransport = this.online;
+    const activeBillboard = this.city.billboards.find((value) => value.id === id);
+    if (!activeTransport || activeBillboard?.state !== "ready") return;
+    // Занята ли ещё хоть одна АЗС, решает сервер: у него состояние заправок
+    // свежее нашего, а отказ он объяснит кодом all-stations-active.
+    this.pushPositionToServer();
+    const requestId = activeTransport.interact("billboard", id);
+    if (!requestId) return;
+    this.billboardRequests.set(requestId, id);
+    this.billboardAttempts.set(id, (this.billboardAttempts.get(id) ?? 0) + 1);
   }
 
   /** Отсчитывает паузы перед повторными запросами по щитам. */
@@ -2389,7 +2439,13 @@ export class CityRideGame {
         // Повторное взаимодействие возможно, но только после того, как игрок
         // отъехал от щита и снова в него въехал.
         if (interactive && this.billboardContact !== b && b.state === "ready") {
-          if (this.hasInactiveStations()) this.discover(b);
+          if (this.hasInactiveStations()) {
+            this.requestBillboardAd(b, (wasShown) => {
+              if (wasShown && b.state === "ready" && this.hasInactiveStations()) {
+                this.discover(b);
+              }
+            });
+          }
           else this.cb.onBillboardUnavailable();
         }
       }
@@ -2514,7 +2570,6 @@ export class CityRideGame {
     }
     sfx.chime();
     this.unlockRandom("ad"); // просмотр рекламы активирует ещё одну АЗС
-    this.cb.onDiscover(b.client, this.city.billboards.indexOf(b) + 1);
     if (firstVisit && this.found >= this.total && !this.won) {
       this.won = true;
       sfx.win();
