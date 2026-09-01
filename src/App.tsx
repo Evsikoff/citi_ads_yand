@@ -44,9 +44,11 @@ import {
   getYandexPurchases,
   getYandexServerTime,
   purchaseYandexProduct,
+  setYandexGameplayActive,
   setYandexPlayerData,
   showFullscreenAd,
   showRewardedVideoAd,
+  signalYandexGameReady,
 } from "./game/yandexGames";
 import type { YandexCatalogProduct } from "./game/yandexGames";
 import {
@@ -234,6 +236,9 @@ export default function App() {
   const [phase, setPhase] = useState<"loading" | "menu" | "play">("loading");
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
   const [fullscreenAdActive, setFullscreenAdActive] = useState(false);
+  const [pageVisible, setPageVisible] = useState(
+    () => typeof document === "undefined" || document.visibilityState === "visible"
+  );
   const [muted, setMuted] = useState(false);
   const [musicOn, setMusicOn] = useState(music.isEnabled);
   const [win, setWin] = useState<{ time: number; top: number } | null>(null);
@@ -464,7 +469,6 @@ export default function App() {
           finished = true;
           fullscreenAdRequest.current = false;
           setFullscreenAdActive(false);
-          gameRef.current?.setPaused(false);
           sfx.setMuted(effectsWereMuted);
           if (musicWasEnabled) music.play();
           // Вне Яндекс Игр, при ошибке SDK и при ограничении частоты реклама
@@ -650,10 +654,43 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    gameRef.current?.setPaused(
-      fullscreenAdActive || !!sell || !!purchasePending || recoveredPurchasesOpen
-    );
-  }, [fullscreenAdActive, sell, purchasePending, recoveredPurchasesOpen]);
+    if (phase === "menu") void signalYandexGameReady();
+  }, [phase]);
+
+  useEffect(() => {
+    const syncVisibility = () => setPageVisible(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", syncVisibility);
+    return () => document.removeEventListener("visibilitychange", syncVisibility);
+  }, []);
+
+  useEffect(() => {
+    const gameplayIsActive =
+      phase === "play" &&
+      pageVisible &&
+      !fullscreenAdActive &&
+      !mapOpen &&
+      !boostersOpen &&
+      !win &&
+      !gameover &&
+      !sell &&
+      !purchasePending &&
+      !recoveredPurchasesOpen;
+
+    gameRef.current?.setPaused(!gameplayIsActive);
+    // Во время собственного загрузочного экрана GameplayAPI ещё не размечаем.
+    if (phase !== "loading") void setYandexGameplayActive(gameplayIsActive);
+  }, [
+    phase,
+    pageVisible,
+    fullscreenAdActive,
+    mapOpen,
+    boostersOpen,
+    win,
+    gameover,
+    sell,
+    purchasePending,
+    recoveredPurchasesOpen,
+  ]);
 
   useEffect(() => {
     if (!boostersOpen) return;
@@ -753,7 +790,6 @@ export default function App() {
       finished = true;
       fullscreenAdRequest.current = false;
       setFullscreenAdActive(false);
-      gameRef.current?.setPaused(false);
       sfx.setMuted(effectsWereMuted);
       if (musicWasEnabled) music.play();
       if (fallback && !rewarded) deliver();
@@ -803,6 +839,7 @@ export default function App() {
     try {
       let purchase;
       try {
+        await setYandexGameplayActive(false);
         purchase = await purchaseYandexProduct(productId);
       } catch (error: unknown) {
         console.info("Покупка не завершена:", error);
@@ -1372,7 +1409,7 @@ export default function App() {
                   <h2 className="font-display text-xl text-[#f2ecdf]">Карта города</h2>
                 </div>
                 <p className="mt-2 text-xs leading-relaxed text-slate-500">
-                  Игра продолжается. Положение игрока и конкурентов обновляется в реальном времени.
+                  Игра приостановлена. Положение игрока и конкурентов продолжает обновляться на карте.
                 </p>
               </div>
               <button

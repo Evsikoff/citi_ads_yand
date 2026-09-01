@@ -42,6 +42,15 @@ interface YandexGamesSdk {
     showFullscreenAdv(options?: { callbacks?: FullscreenAdCallbacks }): void;
     showRewardedVideo(options?: { callbacks?: RewardedVideoAdCallbacks }): void;
   };
+  features?: {
+    LoadingAPI?: {
+      ready(): void;
+    };
+    GameplayAPI?: {
+      start(): void;
+      stop(): void;
+    };
+  };
   payments: YandexPayments;
   getPayments(options?: { signed?: boolean }): Promise<YandexPayments>;
   getFlags(options?: {
@@ -65,6 +74,10 @@ declare global {
 let sdk: YandexGamesSdk | null = null;
 let sdkInitialization: Promise<YandexGamesSdk | null> | null = null;
 let playerInitialization: Promise<YandexPlayer> | null = null;
+let gameReadySignaled = false;
+let gameReadyNotification: Promise<void> | null = null;
+let gameplayActive: boolean | null = null;
+let gameplayTransition = 0;
 
 /** Инициализирует SDK один раз при запуске приложения. */
 export function initYandexGamesSdk(): Promise<YandexGamesSdk | null> {
@@ -89,6 +102,53 @@ export function initYandexGamesSdk(): Promise<YandexGamesSdk | null> {
     });
 
   return sdkInitialization;
+}
+
+/** Сообщает платформе, что загрузочный экран закрыт и главное меню доступно. */
+export function signalYandexGameReady(): Promise<void> {
+  if (gameReadySignaled) return Promise.resolve();
+  if (gameReadyNotification) return gameReadyNotification;
+
+  gameReadyNotification = (async () => {
+    const initializedSdk = sdk ?? (await initYandexGamesSdk());
+    const loadingApi = initializedSdk?.features?.LoadingAPI;
+    if (!loadingApi || gameReadySignaled) return;
+
+    try {
+      loadingApi.ready();
+      gameReadySignaled = true;
+      console.info("Яндекс LoadingAPI: игра готова");
+    } catch (error: unknown) {
+      console.error("Не удалось отправить LoadingAPI.ready():", error);
+    }
+  })().finally(() => {
+    gameReadyNotification = null;
+  });
+
+  return gameReadyNotification;
+}
+
+/**
+ * Синхронизирует разметку GameplayAPI с фактической паузой игры.
+ * Номер перехода не даёт запоздавшей инициализации SDK применить устаревшее
+ * состояние, если игрок успел открыть и закрыть окно во время загрузки SDK.
+ */
+export async function setYandexGameplayActive(active: boolean): Promise<void> {
+  const transition = ++gameplayTransition;
+  const initializedSdk = sdk ?? (await initYandexGamesSdk());
+  if (!initializedSdk || transition !== gameplayTransition || gameplayActive === active) return;
+
+  const gameplayApi = initializedSdk.features?.GameplayAPI;
+  if (!gameplayApi) return;
+
+  try {
+    if (active) gameplayApi.start();
+    else gameplayApi.stop();
+    gameplayActive = active;
+    console.info(`Яндекс GameplayAPI: ${active ? "start" : "stop"}`);
+  } catch (error: unknown) {
+    console.error(`Не удалось отправить GameplayAPI.${active ? "start" : "stop"}():`, error);
+  }
 }
 
 async function requireYandexGamesSdk(): Promise<YandexGamesSdk> {
@@ -156,6 +216,7 @@ export async function setYandexPlayerData(data: Record<string, unknown>): Promis
 
 /** Показывает межстраничную рекламу после готовности SDK. */
 export async function showFullscreenAd(callbacks: FullscreenAdCallbacks): Promise<void> {
+  await setYandexGameplayActive(false);
   const initializedSdk = sdk ?? (await initYandexGamesSdk());
   if (!initializedSdk) {
     callbacks.onError?.(new Error("SDK Яндекс Игр недоступен"));
@@ -171,6 +232,7 @@ export async function showFullscreenAd(callbacks: FullscreenAdCallbacks): Promis
 
 /** Показывает видеорекламу с вознаграждением после готовности SDK. */
 export async function showRewardedVideoAd(callbacks: RewardedVideoAdCallbacks): Promise<void> {
+  await setYandexGameplayActive(false);
   const initializedSdk = sdk ?? (await initYandexGamesSdk());
   if (!initializedSdk) {
     callbacks.onError?.(new Error("SDK Яндекс Игр недоступен"));
