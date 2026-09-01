@@ -43,7 +43,7 @@ export function ClientModal({ client, index, total, onClose }: Props) {
           <span className="w-3 h-3 rounded-full bg-[#3ddc84]" />
           <div className="flex-1 mx-3 flex items-center justify-center gap-2 bg-night-700 rounded-full px-3 py-1.5 text-xs text-slate-400 min-w-0">
             <Lock />
-            <span className="truncate">https://{client.domain}</span>
+            <span className="truncate">{client.domain}</span>
           </div>
           <button
             onClick={onClose}
