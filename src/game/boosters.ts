@@ -153,12 +153,8 @@ export function isBoosterAvailable(
   return true;
 }
 
-/** Заглушки платёжных/рекламных интеграций. Пока считаем внешний шаг успешным. */
+/** Заглушки внешних интеграций, кроме подключённой видеорекламы. */
 export function executeInAppPurchaseStub(_booster: Booster): boolean {
-  return true;
-}
-
-export function executeVideoAdvertisingStub(_booster: Booster): boolean {
   return true;
 }
 
@@ -168,6 +164,8 @@ export function executeOtherSaleMethodStub(_booster: Booster): boolean {
 
 export function executeExternalBoosterSale(booster: Booster): boolean {
   if (booster.sales_method === "In-app purchase") return executeInAppPurchaseStub(booster);
-  if (booster.sales_method === "Video advertising") return executeVideoAdvertisingStub(booster);
+  // Видеореклама асинхронна и обрабатывается через showRewardedVideoAd перед
+  // выдачей бустера. Не разрешаем случайно обойти её синхронной заглушкой.
+  if (booster.sales_method === "Video advertising") return false;
   return executeOtherSaleMethodStub(booster);
 }

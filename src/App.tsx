@@ -19,7 +19,7 @@ import {
 } from "./game/boosters";
 import type { Booster } from "./game/boosters";
 import boostersIcon from "./images/boosters/boosters.png";
-import { showFullscreenAd } from "./game/yandexGames";
+import { showFullscreenAd, showRewardedVideoAd } from "./game/yandexGames";
 import {
   GAME_SERVER_URL,
   MultiplayerClient,
@@ -267,6 +267,7 @@ export default function App() {
           finished = true;
           fullscreenAdRequest.current = false;
           setFullscreenAdActive(false);
+          gameRef.current?.setPaused(false);
           sfx.setMuted(effectsWereMuted);
           if (musicWasEnabled) music.play();
           // Вне Яндекс Игр, при ошибке SDK и при ограничении частоты реклама
@@ -521,11 +522,74 @@ export default function App() {
     showToast("Новая охота: билборды снова доступны, бак полный");
   };
 
-  const buyBooster = (booster: Booster) => {
+  /**
+   * Показывает rewarded-видео и передаёт бустер только после onRewarded.
+   * Если реклама или SDK недоступны, сохраняем общий fallback: действие
+   * считается выполненным без показа.
+   */
+  const showBoosterRewardedVideo = (booster: Booster, deliver: () => void): void => {
+    if (fullscreenAdRequest.current) {
+      showToast("Дождитесь завершения текущей рекламы");
+      return;
+    }
+
+    fullscreenAdRequest.current = true;
+    gameRef.current?.setPaused(true);
+    setFullscreenAdActive(true);
+    const effectsWereMuted = sfx.muted;
+    const musicWasEnabled = music.isEnabled;
+    let finished = false;
+    let rewarded = false;
+
+    const finish = (fallback: boolean, message?: string) => {
+      if (finished) return;
+      finished = true;
+      fullscreenAdRequest.current = false;
+      setFullscreenAdActive(false);
+      gameRef.current?.setPaused(false);
+      sfx.setMuted(effectsWereMuted);
+      if (musicWasEnabled) music.play();
+      if (fallback && !rewarded) deliver();
+      if (message) showToast(message);
+    };
+
+    void showRewardedVideoAd({
+      onOpen: () => {
+        sfx.setMuted(true);
+        music.stop();
+        console.info("Видео-реклама за бустер открыта:", booster.system_name);
+      },
+      onRewarded: () => {
+        if (rewarded) return;
+        rewarded = true;
+        deliver();
+      },
+      onClose: (wasShown) => {
+        console.info("Видео-реклама за бустер закрыта, показана:", wasShown);
+        if (rewarded) finish(false);
+        else if (!wasShown) {
+          finish(true, "Реклама недоступна — бустер выдан без показа");
+        } else {
+          finish(false, "Видео нужно досмотреть, чтобы получить бустер");
+        }
+      },
+      onError: (error) => {
+        console.error("Ошибка показа видео-рекламы за бустер:", error);
+        finish(!rewarded, rewarded ? undefined : "Реклама недоступна — бустер выдан без показа");
+      },
+    });
+  };
+
+  const buyBooster = (booster: Booster, videoCompleted = false): void => {
     const game = gameRef.current;
     if (!game) return;
     const balance = game.getMoney();
     if (!isBoosterAvailable(booster, boosterPurchases, balance, CONFIG.startMoney)) return;
+
+    if (booster.sales_method === "Video advertising" && !videoCompleted) {
+      showBoosterRewardedVideo(booster, () => buyBooster(booster, true));
+      return;
+    }
 
     const cost =
       booster.sales_method === "In-game currency"
@@ -534,7 +598,9 @@ export default function App() {
     const completed =
       booster.sales_method === "In-game currency"
         ? game.trySpendMoney(cost)
-        : executeExternalBoosterSale(booster);
+        : booster.sales_method === "Video advertising"
+          ? videoCompleted
+          : executeExternalBoosterSale(booster);
 
     if (!completed) {
       showToast("Не удалось получить улучшение — попробуй ещё раз");
@@ -588,7 +654,7 @@ export default function App() {
     if (ok) countBoosterPurchase(pending.boosterId);
   };
 
-  const activateInactiveStationBooster = (booster: Booster) => {
+  const activateInactiveStationBooster = (booster: Booster, videoCompleted = false): void => {
     if (
       !inactiveStationNearby ||
       !isBoosterWithinSessionLimit(booster, boosterPurchases)
@@ -601,7 +667,14 @@ export default function App() {
       showToast("Нужно подъехать ближе — заедь на площадку АЗС");
       return;
     }
-    if (!executeExternalBoosterSale(booster)) {
+    if (booster.sales_method === "Video advertising" && !videoCompleted) {
+      showBoosterRewardedVideo(booster, () => activateInactiveStationBooster(booster, true));
+      return;
+    }
+    if (
+      booster.sales_method !== "Video advertising" &&
+      !executeExternalBoosterSale(booster)
+    ) {
       showToast("Не удалось выполнить действие — попробуй ещё раз");
       return;
     }
@@ -956,7 +1029,7 @@ export default function App() {
                       } else if (booster.sales_method === "In-app purchase") {
                         status = "Покупка в приложении · заглушка";
                       } else if (booster.sales_method === "Video advertising") {
-                        status = "Просмотр рекламы · заглушка";
+                        status = "Просмотреть видео и получить";
                       } else {
                         status = `${booster.sales_method} · заглушка`;
                       }
@@ -1584,7 +1657,7 @@ export default function App() {
                     } else if (booster.sales_method === "In-app purchase") {
                       status = "Покупка в приложении · заглушка";
                     } else if (booster.sales_method === "Video advertising") {
-                      status = "Просмотр рекламы · заглушка";
+                      status = "Просмотреть видео и получить";
                     } else {
                       status = `${booster.sales_method} · заглушка`;
                     }

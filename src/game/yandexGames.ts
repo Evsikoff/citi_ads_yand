@@ -4,9 +4,14 @@ export interface FullscreenAdCallbacks {
   onError?(error: unknown): void;
 }
 
+export interface RewardedVideoAdCallbacks extends FullscreenAdCallbacks {
+  onRewarded?(): void;
+}
+
 interface YandexGamesSdk {
   adv: {
     showFullscreenAdv(options?: { callbacks?: FullscreenAdCallbacks }): void;
+    showRewardedVideo(options?: { callbacks?: RewardedVideoAdCallbacks }): void;
   };
 }
 
@@ -58,6 +63,21 @@ export async function showFullscreenAd(callbacks: FullscreenAdCallbacks): Promis
 
   try {
     initializedSdk.adv.showFullscreenAdv({ callbacks });
+  } catch (error: unknown) {
+    callbacks.onError?.(error);
+  }
+}
+
+/** Показывает видеорекламу с вознаграждением после готовности SDK. */
+export async function showRewardedVideoAd(callbacks: RewardedVideoAdCallbacks): Promise<void> {
+  const initializedSdk = sdk ?? (await initYandexGamesSdk());
+  if (!initializedSdk) {
+    callbacks.onError?.(new Error("SDK Яндекс Игр недоступен"));
+    return;
+  }
+
+  try {
+    initializedSdk.adv.showRewardedVideo({ callbacks });
   } catch (error: unknown) {
     callbacks.onError?.(error);
   }
